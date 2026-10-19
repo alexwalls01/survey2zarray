@@ -1,0 +1,85 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "survey2zarray"
+version = "0.1.0.dev0"
+description = "A pipeline for building multi-survey radio astronomy PyTorch datasets from FITS images and source catalogues."
+readme = "README.md"
+requires-python = ">=3.13"
+
+license = { file = "LICENSE" }
+
+authors = [{ name = "Alex Walls" }]
+
+dependencies = [
+    "zarr>=3.1",
+    "numpy>=2",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "astropy>=5.3",
+    # A fork: upstream builds CD as pc_matrix * cdelt elementwise, which is
+    # wrong for any rotated WCS, and it lacks SIN support.
+    "dfreproject @ git+https://github.com/alexwalls01/dfreproject.git@survey2zarray-v0.1",
+    "torch==2.6.0",
+    "torchvision==0.21.0",
+    "tqdm>=4.65",
+    "pyyaml>=6.0",
+    "click>=8.1",
+    "fsspec>=2023.6",
+    "aiohttp>=3.9",
+    "matplotlib>=3.7",
+]
+# For Jupyter notebooks:
+[project.optional-dependencies]
+examples = [
+    "ipykernel>=6.25",
+]
+dev = [
+    "build>=1.2",
+    "pytest>=7.4",
+    "ruff>=0.6",
+    "nbformat>=5.9",
+    "nbclient>=0.9",
+    "reproject>=0.13",
+]
+
+[project.urls]
+Repository = "https://github.com/alexwalls01/survey2zarray"
+Issues = "https://github.com/alexwalls01/survey2zarray/issues"
+
+[project.scripts]
+s2z = "survey2zarray.cli.main:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+    "B",
+    "UP",
+    "W505",
+    "D200",
+    "D205",
+    "D401",
+    "DOC102",
+]
+ignore = ["E501"]
+preview = true
+
+[tool.ruff.lint.pycodestyle]
+max-doc-length = 88
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
