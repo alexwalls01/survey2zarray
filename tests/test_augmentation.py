@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 from astropy import units as u
-from astropy.coordinates import ICRS, SkyCoord
+from astropy.coordinates import FK4, FK5, ICRS, FK4NoETerms, SkyCoord
 from astropy.wcs import WCS
 from dfreproject import calculate_reprojection
 
@@ -137,21 +137,22 @@ class TestSkyTransform:
         )
         assert out[0][0][0].shape == (3, 1, 1)
 
-    def test_batches_all_groups_per_survey_into_one_reprojection(self, monkeypatch):
+    def test_reprojects_each_plane_in_group_order(self, monkeypatch):
         calls = []
 
-        def fake_reprojection(source_hdus, _target_wcs, shape_out, **_kwargs):
-            calls.append(source_hdus)
-            return np.stack(
-                [
-                    np.full(shape_out, np.asarray(source[0]).mean(), dtype=np.float32)
-                    for source in source_hdus
-                ]
+        def fake_reprojection(source_hdu, _target_wcs, shape_out, **_kwargs):
+            calls.append(source_hdu)
+            return np.full(
+                shape_out, np.asarray(source_hdu[0]).mean(), dtype=np.float32
             )
 
         monkeypatch.setattr(
             "survey2zarray.dataset.sky_transforms.calculate_reprojection",
             fake_reprojection,
+        )
+        monkeypatch.setattr(
+            "survey2zarray.dataset.sky_transforms.reproject_interp",
+            lambda *_args, **_kwargs: pytest.fail("ICRS input used reproject_interp"),
         )
         transform = SkyTransform({}, max_crop_size=4.0)
         centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
@@ -170,7 +171,13 @@ class TestSkyTransform:
             np.random.default_rng(0),
         )
 
-        assert [len(source_hdus) for source_hdus in calls] == [3, 2]
+        assert [float(np.asarray(source[0]).mean()) for source in calls] == [
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            4.0,
+        ]
         assert [group[1] for group in out[0]] == [True, False]
         assert out[0][0][0].shape == (2, 4, 4)
         assert out[0][1][0].shape == (1, 4, 4)
@@ -179,7 +186,7 @@ class TestSkyTransform:
         np.testing.assert_array_equal(out[0][1][0][:, 0, 0], [3.0])
         np.testing.assert_array_equal(out[1][0][0][:, 0, 0], [4.0, 4.0])
 
-    def test_batched_planes_match_scalar_reprojection(self):
+    def test_scalar_planes_match_direct_dfreprojection(self):
         transform = SkyTransform({}, MAX_CROP)
         centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
         wcs_in = make_tile_wcs()
@@ -215,6 +222,76 @@ class TestSkyTransform:
                 ]
             )
         np.testing.assert_allclose(out, expected, rtol=1e-6, atol=1e-6, equal_nan=True)
+
+    @pytest.mark.parametrize(
+        ("radesys", "equinox"),
+        (("FK4", 1950.0), ("FK4-NO-E", 1950.0), ("FK5", 2000.0)),
+    )
+    def test_fk_frames_use_astropy_reproject(self, monkeypatch, radesys, equinox):
+        calls = []
+
+        def fake_reproject(source_hdu, target_wcs, shape_out, **kwargs):
+            calls.append((source_hdu, target_wcs, shape_out, kwargs))
+            return np.full(shape_out, np.asarray(source_hdu[0]).mean())
+
+        monkeypatch.setattr(
+            "survey2zarray.dataset.sky_transforms.reproject_interp",
+            fake_reproject,
+        )
+        monkeypatch.setattr(
+            "survey2zarray.dataset.sky_transforms.calculate_reprojection",
+            lambda *_args, **_kwargs: pytest.fail("FK input used dfreproject"),
+        )
+        transform = SkyTransform({}, MAX_CROP)
+        centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
+        wcs_in = make_tile_wcs()
+        wcs_in.wcs.radesys = radesys
+        wcs_in.wcs.equinox = equinox
+        wcs_out = transform._build_skybox_wcs(centre, 8, 8, (1.0, 1.0), 0.0)
+        planes = [np.ones((16, 16)), np.full((16, 16), 2.0)]
+
+        output = transform._reproject_planes(planes, wcs_in, wcs_out, (8, 8))
+
+        assert len(calls) == 2
+        assert all(call[0][1] is wcs_in for call in calls)
+        assert all(call[1] is wcs_out for call in calls)
+        assert all(call[2] == (8, 8) for call in calls)
+        assert all(call[3]["order"] == "bilinear" for call in calls)
+        assert all(call[3]["roundtrip_coords"] is True for call in calls)
+        assert all(call[3]["return_footprint"] is False for call in calls)
+        assert all(call[3]["parallel"] is False for call in calls)
+        assert wcs_out.wcs.radesys == "ICRS"
+        assert output.shape == (2, 8, 8)
+        np.testing.assert_array_equal(output[:, 0, 0], [1.0, 2.0])
+
+    @pytest.mark.parametrize(
+        ("radesys", "equinox", "frame"),
+        (
+            ("FK4", 1950.0, FK4(equinox="B1950")),
+            ("FK4-NO-E", 1950.0, FK4NoETerms(equinox="B1950")),
+            ("FK5", 2000.0, FK5(equinox="J2000")),
+        ),
+    )
+    def test_fk_frames_are_transformed_to_icrs(self, radesys, equinox, frame):
+        transform = SkyTransform({}, MAX_CROP)
+        centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
+        frame_centre = centre.transform_to(frame)
+        wcs_in = make_tile_wcs(
+            ra=frame_centre.ra.deg,
+            dec=frame_centre.dec.deg,
+            nx=32,
+            ny=32,
+        )
+        wcs_in.wcs.radesys = radesys
+        wcs_in.wcs.equinox = equinox
+        wcs_out = transform._build_skybox_wcs(centre, 8, 8, (1.0, 1.0), 0.0)
+        plane = np.ones((32, 32), dtype=np.float32)
+
+        output = transform._reproject_planes([plane], wcs_in, wcs_out, (8, 8))
+
+        assert output.dtype == np.float32
+        assert np.isfinite(output).all()
+        np.testing.assert_allclose(output, 1.0, rtol=1e-6, atol=1e-6)
 
     def test_output_shapes_and_state_sharing(self):
         # One sampled state applied to all surveys: same angular crop size,

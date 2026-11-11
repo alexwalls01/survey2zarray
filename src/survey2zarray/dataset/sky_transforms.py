@@ -6,9 +6,11 @@ from typing import Any
 
 import astropy.units as u
 import numpy as np
-from astropy.coordinates import SkyCoord, SkyOffsetFrame
+from astropy.coordinates import FK4, FK5, FK4NoETerms, SkyCoord, SkyOffsetFrame
 from astropy.wcs import WCS
+from astropy.wcs.utils import wcs_to_celestial_frame
 from dfreproject import calculate_reprojection
+from reproject import reproject_interp
 
 from survey2zarray.utils.logging import get_logger
 
@@ -239,7 +241,14 @@ class SkyTransform:
             ]
         )
         w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        w.wcs.radesys = "ICRS"
         return w
+
+    @staticmethod
+    def _requires_frame_conversion(wcs_in: WCS) -> bool:
+        """Return whether Astropy must transform the input celestial frame."""
+        frame = wcs_to_celestial_frame(wcs_in.celestial)
+        return isinstance(frame, (FK4, FK4NoETerms, FK5))
 
     def _reproject_planes(
         self,
@@ -248,26 +257,42 @@ class SkyTransform:
         wcs_out: WCS,
         shape_out: tuple[int, int],
     ) -> np.ndarray:
-        """Reproject one survey's planes together onto a shared target grid."""
+        """Reproject one survey's planes onto a shared target grid."""
         if not planes:
             return np.empty((0, *shape_out), dtype=np.float32)
 
-        # Disabling flux conservation removes crop size as a brightness cue.
-        # List input lets dfreproject batch planes that share spatial dimensions.
+        use_astropy = self._requires_frame_conversion(wcs_in)
+        output = []
         with warnings.catch_warnings():
             warnings.filterwarnings(
                 "ignore", message=CDELT_IGNORED, category=RuntimeWarning
             )
-            result = calculate_reprojection(
-                [(plane, wcs_in) for plane in planes],
-                wcs_out,
-                shape_out=shape_out,
-                order="bilinear",
-                device="cpu",
-                conserve_flux=False,
-            )
-        # dfreproject squeezes singleton batch and spatial dimensions.
-        return np.asarray(result).reshape(len(planes), *shape_out)
+            for plane in planes:
+                dtype = np.result_type(np.asarray(plane).dtype, np.float32)
+                if use_astropy:
+                    result = reproject_interp(
+                        (plane, wcs_in),
+                        wcs_out,
+                        shape_out=shape_out,
+                        order="bilinear",
+                        roundtrip_coords=True,
+                        return_footprint=False,
+                        parallel=False,
+                    )
+                else:
+                    # Disabling flux conservation removes crop size as a
+                    # brightness cue.
+                    result = calculate_reprojection(
+                        (plane, wcs_in),
+                        wcs_out,
+                        shape_out=shape_out,
+                        order="bilinear",
+                        device="cpu",
+                        conserve_flux=False,
+                    )
+                # dfreproject squeezes singleton spatial dimensions.
+                output.append(np.asarray(result, dtype=dtype).reshape(shape_out))
+        return np.stack(output)
 
     def __call__(
         self,
