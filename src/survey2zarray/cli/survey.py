@@ -82,6 +82,26 @@ def survey() -> None:
     help="Resume an interrupted build, keeping the headers it already read.",
 )
 @click.option("--storage-options", default=None, help=STORAGE_OPTIONS_HELP)
+@click.option(
+    "--band-pattern",
+    default=None,
+    help="Regular expression with a group named 'band', searched in the file name "
+    "of each image whose header records no band, such as '-image-(?P<band>[a-z])'.",
+)
+@click.option(
+    "--blank-value",
+    type=float,
+    default=None,
+    help="Pixel value marking missing data, read as NaN, such as 0 for Legacy "
+    "Surveys coadds.",
+)
+@click.option(
+    "--resolution",
+    type=float,
+    default=None,
+    help="Beam or point spread function FWHM in arcsec, for images whose headers "
+    "record none.",
+)
 def build(
     fits: str,
     out_path: str,
@@ -89,11 +109,15 @@ def build(
     workers: int | None,
     resume: bool,
     storage_options: str | None,
+    band_pattern: str | None,
+    blank_value: float | None,
+    resolution: float | None,
 ) -> None:
-    """Build a survey store from FITS images.
+    """Build a survey store from FITS images, one store per band.
 
     FITS is a directory or bucket prefix of FITS files, one FITS file, or a
-    text file listing locations one per line.
+    text file listing locations one per line. Images in several bands make one
+    store each, named OUT_PATH_<band>.
 
     Parameters
     ----------
@@ -109,17 +133,27 @@ def build(
         Whether to resume an interrupted build.
     storage_options
         JSON filesystem options.
+    band_pattern
+        File-name pattern for bands.
+    blank_value
+        Pixel value marking missing data.
+    resolution
+        FWHM in arcsec for images whose headers record none.
     """
     from survey2zarray.stores.survey_store.build import build_survey_store
 
-    build_survey_store(
+    stores = build_survey_store(
         fits,
         out_path,
         mode=mode,
         max_workers=workers,
         resume=resume,
         storage_options=parse_storage_options(storage_options),
+        band_pattern=band_pattern,
+        blank_value=blank_value,
+        resolution=resolution,
     )
+    click.echo(f"Wrote {', '.join(stores)}.")
 
 
 @survey.command("append")
@@ -186,3 +220,18 @@ def retry(store_path: str, workers: int | None, storage_options: str | None) -> 
         max_workers=workers,
         storage_options=parse_storage_options(storage_options),
     )
+
+
+@survey.command("upgrade")
+@click.argument("store_path", type=click.Path(exists=True, file_okay=False))
+def upgrade(store_path: str) -> None:
+    """Upgrade a survey store to the current schema version.
+
+    Parameters
+    ----------
+    store_path
+        Survey store path.
+    """
+    from survey2zarray.stores.migrations import upgrade_survey_store
+
+    upgrade_survey_store(store_path)

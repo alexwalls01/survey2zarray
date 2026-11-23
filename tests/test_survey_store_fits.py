@@ -113,8 +113,8 @@ class TestExtractMetadata:
         # Pixel scale in arcsec, per axis
         assert metadata["pixel_scale"] == pytest.approx((1.0, 1.0), rel=1e-6)
         # Beam kept in degrees (raw FITS)
-        assert metadata["bmaj"] == pytest.approx(6.0 / 3600.0)
-        assert metadata["bpa"] == pytest.approx(10.0)
+        assert metadata["resolution_major"] == pytest.approx(6.0 / 3600.0)
+        assert metadata["resolution_pa"] == pytest.approx(10.0)
         assert metadata["radesys"] == "ICRS"
         assert metadata["telescope"] == "TESTSCOPE"
         assert len(metadata["crval"]) == 2
@@ -167,20 +167,23 @@ class TestExtractMetadata:
 
 
 class TestCompatibilityCheck:
-    def _metadata(self, path="x.fits", observation_type="continuum", n_chan=None):
+    def _metadata(
+        self, path="x.fits", observation_type="continuum", n_chan=None, band=""
+    ):
         return {
             "image_location": path,
             "observation_type": observation_type,
             "n_chan": n_chan,
+            "band": band,
         }
 
     def test_uniform_continuum_passes(self):
         catalogue = [self._metadata(f"{i}.fits") for i in range(3)]
-        assert check_compatibility(catalogue) == ("continuum", None)
+        assert check_compatibility(catalogue) == ("continuum", None, "")
 
     def test_uniform_spectral_passes(self):
         catalogue = [self._metadata(f"{i}.fits", "spectral", 4) for i in range(2)]
-        assert check_compatibility(catalogue) == ("spectral", 4)
+        assert check_compatibility(catalogue) == ("spectral", 4, "")
 
     def test_mixed_types_abort_identifying_tiles(self):
         catalogue = [self._metadata("a.fits"), self._metadata("b.fits", "spectral", 4)]

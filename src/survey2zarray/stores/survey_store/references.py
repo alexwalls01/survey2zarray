@@ -129,8 +129,12 @@ def data_offset(hdu: fits.PrimaryHDU | fits.ImageHDU) -> int:
     ------
     UnreferenceableFITSError
         Where the offset cannot be determined, which happens when the HDU did
-        not come from a file.
+        not come from a file, or where the pixels are tile compressed.
     """
+    if isinstance(hdu, fits.CompImageHDU):
+        raise UnreferenceableFITSError(
+            "Pixels are tile compressed, so their bytes cannot be read as an array."
+        )
     try:
         location = hdu.fileinfo()["datLoc"]
     except (AttributeError, TypeError, KeyError):

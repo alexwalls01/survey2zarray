@@ -3,6 +3,7 @@
 import json
 import os
 import random
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -19,13 +20,21 @@ from astropy.io import fits
 from tqdm import tqdm
 from zarr.codecs import BloscCodec
 
-from survey2zarray.stores.store import consolidate, create_store
+from survey2zarray.stores.store import (
+    SURVEY_SCHEMA_VERSION,
+    consolidate,
+    create_store,
+    stamp_version,
+)
 from survey2zarray.stores.survey_store.fits import (
     FITSOpenError,
+    IncompatibleTilesError,
     check_compatibility,
     extract_metadata,
     extract_stokes_i,
     get_image_hdu,
+    group_by_band,
+    normalise_band,
     quiet_fits_warnings,
 )
 from survey2zarray.stores.survey_store.references import (
@@ -57,16 +66,23 @@ HEADER_WORKERS: int = 4
 REMOTE_MINIMUM_WORKERS: int = 2
 
 # Accept compressed suffixes because some archives omit a FITS suffix.
-FITS_SUFFIXES: tuple[str, ...] = (".fits", ".fit", ".fts")
+# Tile-compressed ``.fz`` files open directly, unlike COMPRESSED_SUFFIXES.
+FITS_SUFFIXES: tuple[str, ...] = (".fits", ".fit", ".fts", ".fz")
 
 STRING_METADATA_KEYS: list[str] = [
     "ctype",
     "image_location",
     "telescope",
     "bunit",
+    "band",
     "radesys",
     "header",
 ]
+RESOLUTION_KEYS: tuple[str, ...] = (
+    "resolution_major",
+    "resolution_minor",
+    "resolution_pa",
+)
 
 # Exclude credential options because stored configuration travels with every copy.
 SECRET_OPTION_KEYS: frozenset[str] = frozenset(
@@ -419,7 +435,9 @@ def read_header_checkpoint(path: Path) -> dict[str, dict[str, Any]]:
     Returns
     -------
     result
-        Location to its metadata. Empty where there is no checkpoint.
+        Location to its metadata. Empty where there is no checkpoint. Records
+        written for another schema version are dropped, so those files are read
+        again.
     """
     if not path.exists():
         return {}
@@ -429,6 +447,8 @@ def read_header_checkpoint(path: Path) -> dict[str, dict[str, Any]]:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if record.pop("schema_version", None) != SURVEY_SCHEMA_VERSION:
                 continue
             done[record["image_location"]] = record
     return done
@@ -452,6 +472,7 @@ def write_header_checkpoint(handle, metadata: dict[str, Any]) -> None:
         key: list(value) if isinstance(value, tuple) else value
         for key, value in metadata.items()
     }
+    plain["schema_version"] = SURVEY_SCHEMA_VERSION
     handle.write(json.dumps(plain) + "\n")
     handle.flush()
 
@@ -570,6 +591,7 @@ def build_header_index(
     image_record = []
     metadata_record = []
     n_stokes_assumed = 0
+    n_tile_compressed = 0
 
     for position, location in enumerate(fits_locations):
         metadata = metadata_at.get(position)
@@ -578,18 +600,21 @@ def build_header_index(
                 {
                     "image_location": str(location),
                     "observation_type": None,
+                    "band": None,
                     "converted": False,
                     "error": str(errors_at[position]),
                     "array_index": None,
                 }
             )
             continue
-        # Count inferred Stokes axes as read diagnostics.
+        # Count read diagnostics, which are not stored:
         n_stokes_assumed += bool(metadata.pop("stokes_assumed", False))
+        n_tile_compressed += bool(metadata.pop("tile_compressed", False))
         image_record.append(
             {
                 "image_location": str(location),
                 "observation_type": metadata["observation_type"],
+                "band": metadata["band"],
                 "converted": True,
                 "error": None,
                 "array_index": len(header_index),
@@ -640,6 +665,12 @@ def build_header_index(
         logger.warning(
             f"No STOKES axis in {n_stokes_assumed} of {n_ok} files, so Stokes I "
             f"is assumed."
+        )
+    if n_tile_compressed:
+        logger.warning(
+            f"{n_tile_compressed} of {n_ok} files are tile compressed. A copy store "
+            f"holds their pixels decompressed, so expect it to be several times their "
+            f"size on disk. A reference store cannot address them at all."
         )
     if n_ok == 0:
         raise RuntimeError("No usable FITS files found.")
@@ -800,26 +831,28 @@ def write_metadata_arrays(
         data=np.array([m["bandwidth"] for m in header_index], dtype=np.float64),
         chunks=(metadata_chunk_size,),
     )
-    meta.create_array(
-        "bmaj",
-        data=np.array([m["bmaj"] for m in header_index], dtype=np.float64),
-        chunks=(metadata_chunk_size,),
-    )
-    meta.create_array(
-        "bmin",
-        data=np.array([m["bmin"] for m in header_index], dtype=np.float64),
-        chunks=(metadata_chunk_size,),
-    )
-    meta.create_array(
-        "bpa",
-        data=np.array([m["bpa"] for m in header_index], dtype=np.float64),
-        chunks=(metadata_chunk_size,),
-    )
+    # Beam (radio) or point spread function (optical) FWHM, in degrees:
+    for key in RESOLUTION_KEYS:
+        meta.create_array(
+            key,
+            data=np.array([m[key] for m in header_index], dtype=np.float64),
+            chunks=(metadata_chunk_size,),
+        )
     meta.create_array(
         "bunit",
         data=np.array(
             [m["bunit"] for m in header_index], dtype=np.dtypes.StringDType()
         ),
+        chunks=(metadata_chunk_size,),
+    )
+    meta.create_array(
+        "band",
+        data=np.array([m["band"] for m in header_index], dtype=np.dtypes.StringDType()),
+        chunks=(metadata_chunk_size,),
+    )
+    meta.create_array(
+        "zeropoint",
+        data=np.array([m["zeropoint"] for m in header_index], dtype=np.float64),
         chunks=(metadata_chunk_size,),
     )
     meta.create_array(
@@ -917,6 +950,32 @@ def pixel_chunks(
     return (1, depth, *inner), (1, depth, *spatial)
 
 
+def check_referenceable_images(header_index: list[dict[str, Any]]) -> None:
+    """Refuse images whose pixels a byte map cannot address.
+
+    Parameters
+    ----------
+    header_index
+        Metadata dicts, holding ``data_offset`` and ``raw_shape``.
+
+    Raises
+    ------
+    ValueError
+        Where any image's pixels cannot be addressed as byte ranges.
+    """
+    unreferenceable = [
+        metadata["image_location"]
+        for metadata in header_index
+        if metadata.get("data_offset") is None or metadata.get("raw_shape") is None
+    ]
+    if unreferenceable:
+        raise ValueError(
+            f"{len(unreferenceable)} file(s) cannot be referenced. The first is "
+            f"{unreferenceable[0]}. Tile compression, scaled pixels, or an "
+            f"unsupported bit depth may be present. Build this survey in copy mode."
+        )
+
+
 def write_reference_map(
     out_path: Path,
     header_index: list[dict[str, Any]],
@@ -946,18 +1005,7 @@ def write_reference_map(
     ValueError
         Where any image's pixels cannot be addressed as byte ranges.
     """
-    unreferenceable = [
-        metadata["image_location"]
-        for metadata in header_index
-        if metadata.get("data_offset") is None or metadata.get("raw_shape") is None
-    ]
-    if unreferenceable:
-        raise ValueError(
-            f"{len(unreferenceable)} file(s) cannot be referenced. The first is "
-            f"{unreferenceable[0]}. Scaled pixels or unsupported bit depth may "
-            f"be present. Build this survey in copy mode."
-        )
-
+    check_referenceable_images(header_index)
     images = [
         {
             "location": str(metadata["image_location"]),
@@ -1026,6 +1074,10 @@ def create_survey_store(
     image_valid_df: pd.DataFrame | None = None,
     metadata_valid_df: pd.DataFrame | None = None,
     storage_options: dict[str, dict] | None = None,
+    band: str = "",
+    blank_value: float | None = None,
+    resolution: float | None = None,
+    band_pattern: str | None = None,
 ) -> zarr.Group:
     """Write a survey store from an already-validated image catalogue.
 
@@ -1055,6 +1107,15 @@ def create_survey_store(
         Filesystem options keyed by protocol, as `options_for` takes them.
         Recorded in the store, less any credential, so that a reference store
         can reconstruct its filesystem configuration.
+    band
+        Band shared by every image, or an empty string where none is recorded.
+    blank_value
+        Pixel value marking missing data, which reads return as NaN.
+    resolution
+        FWHM in arcsec given to images whose headers record none, applied to
+        later appends as well.
+    band_pattern
+        File-name pattern for bands, applied to later appends as well.
 
     Returns
     -------
@@ -1065,11 +1126,19 @@ def create_survey_store(
     out_path = Path(out_path)
     root = create_store(out_path)
     root.attrs["complete"] = False
+    stamp_version(root, SURVEY_SCHEMA_VERSION)
     root.attrs["n_images"] = len(header_index)
     root.attrs["observation_type"] = observation_type
     root.attrs["access_mode"] = access_mode
+    root.attrs["band"] = band
     if n_chan is not None:
         root.attrs["n_chan"] = int(n_chan)
+    if blank_value is not None:
+        root.attrs["blank_value"] = float(blank_value)
+    if resolution is not None:
+        root.attrs["resolution"] = float(resolution)
+    if band_pattern is not None:
+        root.attrs["band_pattern"] = band_pattern
     recorded = persistable_options(storage_options)
     if recorded:
         root.attrs["storage_options"] = recorded
@@ -1114,6 +1183,142 @@ def create_survey_store(
     return root
 
 
+def compile_band_pattern(band_pattern: str | None) -> re.Pattern | None:
+    """Compile a file-name pattern for bands, checking it names a band group.
+
+    Parameters
+    ----------
+    band_pattern
+        Regular expression with a named group ``band``, or None.
+
+    Returns
+    -------
+    result
+        Compiled pattern, or None where none was given.
+
+    Raises
+    ------
+    ValueError
+        Where the pattern has no group named ``band``.
+    """
+    if band_pattern is None:
+        return None
+    pattern = re.compile(band_pattern)
+    if "band" not in pattern.groupindex:
+        raise ValueError(
+            f"band_pattern must contain a group named 'band', got {band_pattern!r}."
+        )
+    return pattern
+
+
+def apply_band_pattern(header_index: list[dict[str, Any]], pattern: re.Pattern) -> None:
+    """Read the band from the file name of each image whose header gives none.
+
+    Parameters
+    ----------
+    header_index
+        Metadata dicts, updated in place.
+    pattern
+        Compiled pattern with a group named ``band``, searched in the file name.
+    """
+    for metadata in header_index:
+        if metadata["band"]:
+            continue
+        name = urlparse(str(metadata["image_location"])).path.rsplit("/", 1)[-1]
+        match = pattern.search(name)
+        if match and match.group("band"):
+            metadata["band"] = normalise_band(match.group("band"))
+
+
+def apply_resolution(header_index: list[dict[str, Any]], resolution: float) -> int:
+    """Give a resolution to each image whose header records none.
+
+    Parameters
+    ----------
+    header_index
+        Metadata dicts, updated in place.
+    resolution
+        Circular FWHM in arcsec.
+
+    Returns
+    -------
+    result
+        Number of images given the resolution.
+
+    Raises
+    ------
+    ValueError
+        Where ``resolution`` is not a positive finite number.
+    """
+    if not np.isfinite(resolution) or resolution <= 0:
+        raise ValueError(f"resolution must be positive, got {resolution} arcsec.")
+    filled = 0
+    for metadata in header_index:
+        if np.isfinite(metadata["resolution_major"]):
+            continue
+        metadata["resolution_major"] = resolution / 3600.0
+        metadata["resolution_minor"] = resolution / 3600.0
+        metadata["resolution_pa"] = np.nan
+        filled += 1
+    return filled
+
+
+def band_store_path(out_path: Path, band: str) -> Path:
+    """Return where one band's store goes when a build holds several bands.
+
+    Parameters
+    ----------
+    out_path
+        Destination the build was given.
+    band
+        Band label.
+
+    Returns
+    -------
+    result
+        ``out_path`` with ``_<band>`` added to its name, before any ``.zarr``.
+    """
+    if out_path.suffix == ".zarr":
+        return out_path.with_name(f"{out_path.stem}_{band}{out_path.suffix}")
+    return out_path.with_name(f"{out_path.name}_{band}")
+
+
+def band_records(
+    image_valid_df: pd.DataFrame,
+    metadata_valid_df: pd.DataFrame,
+    images: list[dict[str, Any]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Select the provenance records belonging to one band's store.
+
+    Files that could not be read have no known band, so every band keeps them.
+
+    Parameters
+    ----------
+    image_valid_df, metadata_valid_df
+        Records for the whole build.
+    images
+        Metadata dicts of the band, in store order.
+
+    Returns
+    -------
+    image_valid
+        Read files of the band with their row in its store, then unread files.
+    metadata_valid
+        Rows for the band's files.
+    """
+    row_of = {str(m["image_location"]): row for row, m in enumerate(images)}
+    image_valid = image_valid_df.copy()
+    held = image_valid["image_location"].isin(row_of)
+    unread = ~image_valid["converted"].astype(bool)
+    image_valid = image_valid[held | unread].copy()
+    image_valid["array_index"] = image_valid["image_location"].map(row_of)
+    image_valid.loc[image_valid["converted"].astype(bool), "band"] = images[0]["band"]
+    metadata_valid = metadata_valid_df[
+        metadata_valid_df["image_location"].isin(row_of)
+    ].reset_index(drop=True)
+    return image_valid.reset_index(drop=True), metadata_valid
+
+
 def build_survey_store(
     fits: str | Path | list[str],
     out_path: str | Path,
@@ -1123,8 +1328,14 @@ def build_survey_store(
     max_workers: int | None = None,
     resume: bool = False,
     storage_options: dict[str, dict] | None = None,
-) -> zarr.Group:
-    """Build a survey store from a set of FITS images.
+    band_pattern: str | None = None,
+    blank_value: float | None = None,
+    resolution: float | None = None,
+) -> dict[str, zarr.Group]:
+    """Build one survey store per band from a set of FITS images.
+
+    Images with one band, or none, make one store at ``out_path``. Images in
+    several bands make one store each, named by `band_store_path`.
 
     Parameters
     ----------
@@ -1149,17 +1360,31 @@ def build_survey_store(
         Filesystem options keyed by protocol, as ``{'s3': {'anon': True}}``.
         Used for every served file the build touches, and recorded in the store
         for reference reads. Credentials are omitted. See `persistable_options`.
+    band_pattern
+        Regular expression with a group named ``band``, searched in the file
+        name of each image whose header records no band.
+    blank_value
+        Pixel value marking missing data, such as ``0.0`` for Legacy Surveys
+        coadds. Reads return it as NaN.
+    resolution
+        Beam or point spread function FWHM in arcsec, given to images whose
+        headers record none.
 
     Returns
     -------
     result
-        Root group of the finished store.
+        Root group of each finished store, keyed by its directory name.
 
     Raises
     ------
     IncompatibleTilesError
-        Where the images cannot share one store, in which case nothing is
-        written.
+        Where the images of a band cannot share one store, or only some images
+        have a band, in which case nothing is written.
+    ValueError
+        Where reference mode is asked for and an image's pixels cannot be
+        addressed as byte ranges, in which case nothing is written.
+    FileExistsError
+        Where a destination holds something other than a store.
     RuntimeError
         Where no file could be read.
     """
@@ -1168,6 +1393,10 @@ def build_survey_store(
         raise ValueError(f"mode must be 'copy' or 'reference', got {mode!r}.")
     if mode not in ("copy", "reference"):
         raise ValueError(f"Expected mode 'copy' or 'reference', got {mode!r}.")
+    if blank_value is not None and not np.isfinite(blank_value):
+        raise ValueError(f"blank_value must be finite, got {blank_value}.")
+    pattern = compile_band_pattern(band_pattern)
+    out_path = Path(out_path)
     fits_paths = resolve_fits_list(fits, storage_options)
     # Keep the checkpoint beside the target so store replacement preserves it.
     checkpoint = Path(str(out_path) + HEADER_CHECKPOINT_SUFFIX)
@@ -1180,19 +1409,71 @@ def build_survey_store(
         checkpoint=checkpoint,
         storage_options=storage_options,
     )
-    observation_type, n_chan = check_compatibility(header_index)
-    root = create_survey_store(
-        header_index,
-        observation_type,
-        n_chan,
-        access_mode=mode,
-        out_path=out_path,
-        chunk_bytes=chunk_bytes,
-        image_dtype=image_dtype,
-        image_valid_df=image_valid_df,
-        metadata_valid_df=metadata_valid_df,
-        storage_options=storage_options,
-    )
-    # Remove the checkpoint only after publishing the completed store.
+    if pattern is not None:
+        apply_band_pattern(header_index, pattern)
+    if resolution is not None:
+        filled = apply_resolution(header_index, resolution)
+        if filled:
+            logger.info(f"Gave {filled} image(s) a resolution of {resolution} arcsec.")
+        else:
+            logger.warning(
+                f"Every header records a resolution, so resolution={resolution} "
+                f"was not used."
+            )
+
+    by_band = group_by_band(header_index)
+    targets = {
+        band: out_path if len(by_band) == 1 else band_store_path(out_path, band)
+        for band in by_band
+    }
+    # Check every band before writing any store:
+    problems, plans = [], {}
+    for band, images in by_band.items():
+        try:
+            plans[band] = check_compatibility(images)
+        except IncompatibleTilesError as error:
+            problems.append(f"Band {band}. {error}" if band else str(error))
+    if problems:
+        raise IncompatibleTilesError("\n".join(problems))
+    if mode == "reference":
+        check_referenceable_images(header_index)
+    for target in targets.values():
+        if (
+            target.is_dir()
+            and any(target.iterdir())
+            and not (target / "zarr.json").exists()
+        ):
+            raise FileExistsError(
+                f"{target} exists and is not a store, so it is not overwritten."
+            )
+    if len(by_band) > 1:
+        logger.info(
+            f"Found {len(by_band)} bands, so writing "
+            f"{', '.join(str(t) for t in targets.values())}."
+        )
+
+    stores = {}
+    for band, images in by_band.items():
+        observation_type, n_chan, _ = plans[band]
+        image_valid, metadata_valid = band_records(
+            image_valid_df, metadata_valid_df, images
+        )
+        stores[targets[band].name] = create_survey_store(
+            images,
+            observation_type,
+            n_chan,
+            access_mode=mode,
+            out_path=targets[band],
+            chunk_bytes=chunk_bytes,
+            image_dtype=image_dtype,
+            image_valid_df=image_valid,
+            metadata_valid_df=metadata_valid,
+            storage_options=storage_options,
+            band=band,
+            blank_value=blank_value,
+            resolution=resolution,
+            band_pattern=band_pattern,
+        )
+    # Remove the checkpoint only after publishing every completed store.
     checkpoint.unlink(missing_ok=True)
-    return root
+    return stores

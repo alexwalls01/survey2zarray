@@ -127,6 +127,50 @@ def make_continuum_4d_fits(
     return write_fits(path, data, header), data
 
 
+def make_optical_fits(
+    path,
+    band="g",
+    shape_yx=(64, 64),
+    ra=IMAGE_RA,
+    dec=IMAGE_DEC,
+    seed=0,
+    band_keyword="BAND",
+    band_in_primary=False,
+    compressed=False,
+    zeropoint=None,
+    blank_box=None,
+    **kwargs,
+):
+    # Optical coadd: no beam, a filter keyword, optionally tile compressed or
+    # with the filter in the primary header of a multi-extension file. Integer
+    # pixels keep tile compression lossless.
+    header = make_header(shape_yx=shape_yx, ra=ra, dec=dec, with_beam=False, **kwargs)
+    header["BUNIT"] = "nanomaggy"
+    primary = fits.Header()
+    if band:
+        (primary if band_in_primary else header)[band_keyword] = band
+    if zeropoint is not None:
+        header["MAGZERO"] = zeropoint
+    data = (np.random.default_rng(seed).integers(1, 1000, size=shape_yx)).astype(
+        np.float32
+    )
+    if blank_box is not None:
+        y0, y1, x0, x1 = blank_box
+        data[y0:y1, x0:x1] = 0.0
+    if compressed:
+        image = fits.CompImageHDU(data=data, header=header, quantize_level=0.0)
+        fits.HDUList([fits.PrimaryHDU(header=primary), image]).writeto(
+            path, overwrite=True
+        )
+    elif band_in_primary:
+        fits.HDUList(
+            [fits.PrimaryHDU(header=primary), fits.ImageHDU(data=data, header=header)]
+        ).writeto(path, overwrite=True)
+    else:
+        write_fits(path, data, header)
+    return Path(path), data
+
+
 def make_spectral_fits(
     path, shape_yx=(48, 48), n_chan=3, ra=IMAGE_RA, dec=IMAGE_DEC, seed=0, **kwargs
 ):

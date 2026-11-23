@@ -11,7 +11,12 @@ import zarr
 from astropy.io import fits
 from astropy.wcs import WCS
 
-from survey2zarray.stores.store import open_store
+from survey2zarray.stores.migrations import SURVEY_READ_ADAPTERS, adapt_metadata
+from survey2zarray.stores.store import (
+    SURVEY_SCHEMA_VERSION,
+    check_readable,
+    open_store,
+)
 from survey2zarray.stores.survey_store.fits import stokes_i_planes
 from survey2zarray.stores.survey_store.references import (
     MAX_REQUEST_BYTES,
@@ -88,6 +93,15 @@ class SurveyStore:
         Number of images.
     n_chan
         Channel count for spectral stores.
+    blank_value
+        Pixel value marking missing data, read as NaN. None where unset.
+    resolution_major, resolution_minor, resolution_pa
+        Beam (radio) or point spread function (optical) FWHM axes and position
+        angle per image, in degrees.
+    band
+        Band label per image, empty where none is recorded.
+    zeropoint
+        Photometric zeropoint per image in AB magnitudes, NaN where unknown.
 
     Raises
     ------
@@ -111,6 +125,7 @@ class SurveyStore:
             raise RuntimeError(
                 f"Conversion of {path} is incomplete. Reconvert it before use."
             )
+        self.schema_version = check_readable(root, SURVEY_SCHEMA_VERSION, path)
         # Build metadata fixes the observation type independently of array shape.
         self.observation_type = root.attrs["observation_type"]
         self.access_mode = root.attrs["access_mode"]
@@ -129,9 +144,15 @@ class SurveyStore:
         self.storage_options = dict(storage_options or {})
         self.n_images = root.attrs["n_images"]
         self.n_chan = root.attrs.get("n_chan")
+        self.blank_value = root.attrs.get("blank_value")
 
         # Single metadata chunks require one read per array.
-        metadata = root["metadata"]
+        metadata = adapt_metadata(
+            root["metadata"],
+            self.schema_version,
+            SURVEY_SCHEMA_VERSION,
+            SURVEY_READ_ADAPTERS,
+        )
         self.crval = metadata["crval"][:]
         self.crpix = metadata["crpix"][:]
         self.cd = metadata["cd"][:]
@@ -144,10 +165,12 @@ class SurveyStore:
         self.frequency = metadata["frequency"][:]
         self.bandwidth = metadata["bandwidth"][:]
         self.date = metadata["date"][:]
-        self.bmaj = metadata["bmaj"][:]
-        self.bmin = metadata["bmin"][:]
-        self.bpa = metadata["bpa"][:]
+        self.resolution_major = metadata["resolution_major"][:]
+        self.resolution_minor = metadata["resolution_minor"][:]
+        self.resolution_pa = metadata["resolution_pa"][:]
         self.bunit = metadata["bunit"][:]
+        self.band = metadata["band"][:]
+        self.zeropoint = metadata["zeropoint"][:]
         self.equinox = metadata["equinox"][:]
         self.radesys = metadata["radesys"][:]
         # Load Stokes metadata lazily for reference-mode reductions.
@@ -253,7 +276,7 @@ class SurveyStore:
         -------
         result
             ``(y1 - y0, x1 - x0)`` for continuum, with a leading channel axis
-            for spectral data.
+            for spectral data. Pixels equal to ``blank_value`` are NaN.
         """
         image_index = int(image_index)
         if self.access_mode == "copy":
@@ -261,8 +284,12 @@ class SurveyStore:
                 cutout = self.root["data"][image_index, :, y0:y1, x0:x1]
             else:
                 cutout = self.root["data"][image_index, y0:y1, x0:x1]
-            return np.asarray(cutout)
-        return self.read_referenced_region(image_index, x0, x1, y0, y1)
+            cutout = np.asarray(cutout)
+        else:
+            cutout = self.read_referenced_region(image_index, x0, x1, y0, y1)
+        if self.blank_value is None:
+            return cutout
+        return np.where(cutout == self.blank_value, np.nan, cutout)
 
     def read_referenced_region(
         self, image_index: int, x0: int, x1: int, y0: int, y1: int

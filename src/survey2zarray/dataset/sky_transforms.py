@@ -10,6 +10,7 @@ from astropy.coordinates import FK4, FK5, FK4NoETerms, SkyCoord, SkyOffsetFrame
 from astropy.wcs import WCS
 from astropy.wcs.utils import wcs_to_celestial_frame
 from dfreproject import calculate_reprojection
+from dfreproject.reproject import VALID_PROJECTIONS
 from reproject import reproject_interp
 
 from survey2zarray.utils.logging import get_logger
@@ -19,6 +20,24 @@ logger = get_logger(__name__)
 # dfreproject queries cdelt even when the stored cd matrix defines reprojection.
 # Suppress the resulting Astropy warning for every plane.
 CDELT_IGNORED = "cdelt will be ignored since cd is present"
+
+
+def projection_code(wcs: WCS) -> str:
+    """Return the three-letter projection code of a WCS's longitude axis.
+
+    Parameters
+    ----------
+    wcs
+        WCS with celestial axes.
+
+    Returns
+    -------
+    result
+        Code such as ``'TAN'``, from a CTYPE such as ``'RA---TAN-SIP'``. Empty
+        where the CTYPE names none.
+    """
+    fields = [field for field in str(wcs.celestial.wcs.ctype[0]).split("-") if field]
+    return fields[1].upper() if len(fields) > 1 else ""
 
 
 class SkyTransform:
@@ -245,10 +264,16 @@ class SkyTransform:
         return w
 
     @staticmethod
-    def _requires_frame_conversion(wcs_in: WCS) -> bool:
-        """Return whether Astropy must transform the input celestial frame."""
+    def _requires_astropy(wcs_in: WCS) -> bool:
+        """Return whether Astropy must reproject an input.
+
+        dfreproject neither converts FK frames nor implements projections
+        outside `VALID_PROJECTIONS`, which it would replace with TAN.
+        """
         frame = wcs_to_celestial_frame(wcs_in.celestial)
-        return isinstance(frame, (FK4, FK4NoETerms, FK5))
+        if isinstance(frame, (FK4, FK4NoETerms, FK5)):
+            return True
+        return projection_code(wcs_in) not in VALID_PROJECTIONS
 
     def _reproject_planes(
         self,
@@ -261,7 +286,7 @@ class SkyTransform:
         if not planes:
             return np.empty((0, *shape_out), dtype=np.float32)
 
-        use_astropy = self._requires_frame_conversion(wcs_in)
+        use_astropy = self._requires_astropy(wcs_in)
         output = []
         with warnings.catch_warnings():
             warnings.filterwarnings(

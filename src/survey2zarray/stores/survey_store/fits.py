@@ -188,14 +188,14 @@ def resolve_beam(header: fits.Header) -> dict[str, float]:
     Returns
     -------
     result
-        Keys ``bmaj``, ``bmin``, and ``bpa``, all in degrees, each NaN where
-        unavailable.
+        Keys ``resolution_major``, ``resolution_minor``, and ``resolution_pa``,
+        all in degrees, each NaN where unavailable.
     """
     if all(k in header for k in ["BMAJ", "BMIN"]):
         return {
-            "bmaj": float(header["BMAJ"]),
-            "bmin": float(header["BMIN"]),
-            "bpa": float(header.get("BPA", np.nan)),
+            "resolution_major": float(header["BMAJ"]),
+            "resolution_minor": float(header["BMIN"]),
+            "resolution_pa": float(header.get("BPA", np.nan)),
         }
     history = header.get("HISTORY", [])
     # FITS readers may expose HISTORY as one string or a sequence.
@@ -208,14 +208,14 @@ def resolve_beam(header: fits.Header) -> dict[str, float]:
             bpa = re.search(r"BPA=\s*([-\d.Ee+]+)", line)
             if bmaj and bmin:
                 return {
-                    "bmaj": float(bmaj.group(1)),
-                    "bmin": float(bmin.group(1)),
-                    "bpa": float(bpa.group(1)) if bpa else np.nan,
+                    "resolution_major": float(bmaj.group(1)),
+                    "resolution_minor": float(bmin.group(1)),
+                    "resolution_pa": float(bpa.group(1)) if bpa else np.nan,
                 }
     return {
-        "bmaj": np.nan,
-        "bmin": np.nan,
-        "bpa": np.nan,
+        "resolution_major": np.nan,
+        "resolution_minor": np.nan,
+        "resolution_pa": np.nan,
     }
 
 
@@ -236,6 +236,113 @@ def resolve_bunit(header: fits.Header) -> str:
     if val:
         return str(val).strip()
     return ""
+
+
+# Filter keywords, in order of preference:
+BAND_KEYWORDS: tuple[str, ...] = (
+    "BAND",
+    "FILTER",
+    "FILTNAM",
+    "FILTER1",
+    "FILTER2",
+    "FPA.FILTER",
+)
+# Filter wheel positions that name no band:
+EMPTY_FILTERS: tuple[str, ...] = ("clear", "open", "empty", "none", "n/a")
+ZEROPOINT_KEYWORDS: tuple[str, ...] = ("MAGZERO", "MAGZP", "PHOTZP", "ZEROPT")
+
+
+def normalise_band(value: Any) -> str:
+    """Reduce a filter name to a short band label.
+
+    Take the first word, drop everything after its first ``.``, and keep the
+    part after its last ``-``, so ``'HSC-G'``, ``'g.00000'``, and
+    ``'g DECam SDSS c0001'`` all give ``'g'``.
+
+    Parameters
+    ----------
+    value
+        Filter name as a header records it.
+
+    Returns
+    -------
+    result
+        Lower-case label of letters, digits, and underscores. Empty where
+        nothing remains.
+    """
+    words = str(value).strip().lower().split()
+    if not words:
+        return ""
+    label = words[0].split(".")[0].rsplit("-", 1)[-1]
+    return re.sub(r"[^a-z0-9_]", "", label)
+
+
+def resolve_band(header: fits.Header, primary_header: fits.Header | None = None) -> str:
+    """Return the band an image was observed in, or an empty string.
+
+    Multi-extension files often record the filter in the primary header alone,
+    so it is searched after the image header.
+
+    Parameters
+    ----------
+    header
+        Header of the image HDU.
+    primary_header
+        Primary header, where the image HDU is an extension.
+
+    Returns
+    -------
+    result
+        Band label as `normalise_band` gives it.
+    """
+    for source in (header, primary_header):
+        if source is None:
+            continue
+        for key in BAND_KEYWORDS:
+            text = str(source.get(key, "")).strip().lower()
+            if not text or text.startswith(EMPTY_FILTERS):
+                continue
+            band = normalise_band(text)
+            if band:
+                return band
+    return ""
+
+
+def resolve_zeropoint(
+    header: fits.Header, primary_header: fits.Header | None = None
+) -> float:
+    """Return the photometric zeropoint in AB magnitudes.
+
+    Parameters
+    ----------
+    header
+        Header of the image HDU.
+    primary_header
+        Primary header, where the image HDU is an extension.
+
+    Returns
+    -------
+    result
+        Zeropoint, or NaN where unavailable.
+    """
+    for source in (header, primary_header):
+        if source is None:
+            continue
+        for key in ZEROPOINT_KEYWORDS:
+            try:
+                value = float(source[key])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if np.isfinite(value):
+                return value
+        # HSC records the flux of a zero-magnitude source:
+        try:
+            flux = float(source["FLUXMAG0"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if np.isfinite(flux) and flux > 0:
+            return float(2.5 * np.log10(flux))
+    return np.nan
 
 
 def resolve_equinox(header: fits.Header) -> float:
@@ -747,6 +854,7 @@ def extract_metadata(
 
     Use one extraction path for local and remote inputs. Store the WCS after
     Stokes selection, including celestial axes and the spectral frequency axis.
+    An image with a band is optical, so a missing STOKES axis is not reported.
     Callers wrap concurrent passes in `quiet_fits_warnings` to avoid global
     warning-filter races.
 
@@ -781,13 +889,16 @@ def extract_metadata(
                 raise InvalidFITSError(str(error)) from error
         # Fetch opening byte ranges for remote headers before opening full files.
         sources = header_sources(path, storage_options=storage_options)
-        header, pixel_offset = None, None
+        header, primary_header, pixel_offset = None, None, None
         for index, source in enumerate(sources):
             last = index == len(sources) - 1
             try:
                 with fits.open(source(), memmap=False) as hdul:
                     hdu = get_image_hdu(hdul)
                     header = hdu.header.copy()
+                    if hdu is not hdul[0]:
+                        primary_header = hdul[0].header.copy()
+                    tile_compressed = isinstance(hdu, fits.CompImageHDU)
                     try:
                         pixel_offset = data_offset(hdu)
                     except UnreferenceableFITSError:
@@ -841,9 +952,7 @@ def extract_metadata(
     frequency = resolve_frequency(header)
     bandwidth = resolve_bandwidth(header)
     beam = resolve_beam(header)
-    bmaj = beam["bmaj"]
-    bmin = beam["bmin"]
-    bpa = beam["bpa"]
+    band = resolve_band(header, primary_header)
     metadata = {
         "crval": crval,
         "crpix": crpix,
@@ -858,10 +967,10 @@ def extract_metadata(
         "date": date,
         "frequency": frequency,
         "bandwidth": bandwidth,
-        "bmaj": bmaj,
-        "bmin": bmin,
-        "bpa": bpa,
+        **beam,
         "bunit": resolve_bunit(header),
+        "band": band,
+        "zeropoint": resolve_zeropoint(header, primary_header),
         "equinox": resolve_equinox(header),
         "radesys": resolve_radesys(header),
         "header": header.tostring(),
@@ -870,14 +979,69 @@ def extract_metadata(
         "data_offset": pixel_offset,
         "raw_shape": raw_shape,
         "raw_dtype": raw_dtype,
-        "stokes_assumed": locate_stokes_axis(header) is None,
+        # Diagnostics, counted and removed by the header pass:
+        "stokes_assumed": band == "" and locate_stokes_axis(header) is None,
+        "tile_compressed": tile_compressed,
     }
     return metadata
 
 
+def bandless_problem(bands: dict[str, list[str]]) -> str | None:
+    """Describe images with no band among images that have one.
+
+    Parameters
+    ----------
+    bands
+        Image locations keyed by band, with ``''`` for no band.
+
+    Returns
+    -------
+    result
+        The problem, or None where every image or no image has a band.
+    """
+    if "" in bands and len(bands) > 1:
+        return (
+            f"Headers give no band for {bands['']}, but give one for the other "
+            f"images. Pass band_pattern to read it from the file names."
+        )
+    return None
+
+
+def group_by_band(
+    image_catalogue: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Group images by band, keeping their order within each band.
+
+    Parameters
+    ----------
+    image_catalogue
+        Metadata dicts as returned by `extract_metadata`.
+
+    Returns
+    -------
+    result
+        Images keyed by band, in band order. One key, ``''``, where no image
+        has a band.
+
+    Raises
+    ------
+    IncompatibleTilesError
+        Where only some images have a band.
+    """
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for m in image_catalogue:
+        groups.setdefault(m["band"], []).append(m)
+    problem = bandless_problem(
+        {band: [m["image_location"] for m in images] for band, images in groups.items()}
+    )
+    if problem:
+        raise IncompatibleTilesError(problem)
+    return dict(sorted(groups.items()))
+
+
 def check_compatibility(
     image_catalogue: list[dict[str, Any]],
-) -> tuple[str | None, int | None]:
+) -> tuple[str | None, int | None, str]:
     """Check that a set of images can share one store, or raise.
 
     Height and width may differ between images; padding handles that. Every
@@ -895,14 +1059,28 @@ def check_compatibility(
         The type shared by every image.
     n_chan
         Channel count shared by every image, None for continuum.
+    band
+        Band shared by every image, ``''`` where none has one.
 
     Raises
     ------
     IncompatibleTilesError
-        Where types are mixed or undeterminable, or spectral channel counts
-        differ. The message names the offending images.
+        Where types are mixed or undeterminable, spectral channel counts
+        differ, or bands differ. The message names the offending images.
     """
     problems = []
+    bands: dict[str, list[str]] = {}
+    for m in image_catalogue:
+        bands.setdefault(m["band"], []).append(m["image_location"])
+    problem = bandless_problem(bands)
+    if problem:
+        problems.append(problem)
+    elif len(bands) > 1:
+        listing = ". ".join(
+            f"band {b} applies to {v}" for b, v in sorted(bands.items())
+        )
+        problems.append(f"All images must share one band. Found {listing}.")
+    band = next(iter(bands)) if len(bands) == 1 else ""
     types = {}
     for m in image_catalogue:
         types.setdefault(m["observation_type"], []).append(m["image_location"])
@@ -929,4 +1107,4 @@ def check_compatibility(
             n_chan = next(iter(n_chans))
     if problems:
         raise IncompatibleTilesError("\n".join(problems))
-    return observation_type, n_chan
+    return observation_type, n_chan, band

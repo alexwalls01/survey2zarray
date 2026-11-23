@@ -463,7 +463,7 @@ class TestBuildDatasetStore:
         sub = DatasetStore.open(out).survey("survey_a")
         assert sub.observation_type == "continuum"
         # Beam stays in degrees (raw FITS), frequency in Hz, pixel scale in arcsec
-        assert sub.bmaj[0] == pytest.approx(6.0 / 3600.0)
+        assert sub.resolution_major[0] == pytest.approx(6.0 / 3600.0)
         assert sub.frequency[0] == pytest.approx(1.4e9)
         assert tuple(sub.pixel_scale[0]) == pytest.approx((1.0, 1.0), rel=1e-6)
         assert tuple(sub.pixel_shape[0]) == (27, 27)
@@ -573,7 +573,7 @@ class TestBuildDatasetStore:
 
 
 class TestBuildTimeDuplicateSources:
-    # The images carry bmaj = 6", so sources closer than that are unresolvable
+    # The images record a 6" resolution, so sources closer than that are unresolvable
     # by this survey and count as one source (§12.1)
 
     def test_within_beam_duplicate_dropped_keeping_first(

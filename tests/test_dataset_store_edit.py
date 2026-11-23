@@ -158,7 +158,7 @@ class TestAppendSources:
         assert sizes == [1, 1]
 
     def test_duplicate_within_beam_skipped(self, dataset_store_path, tmp_path, caplog):
-        # 2" from src_0: inside the 6" (bmaj) beam of the only survey
+        # 2" from src_0: inside the 6" resolution of the only survey
         # observing both -> the instrument cannot separate them -> duplicate
         catalogue = make_catalogue(
             tmp_path,

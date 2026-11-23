@@ -28,6 +28,8 @@ WRITING: str = "writing"
 COMMITTED: str = "committed"
 # Place the lock beside the store to exclude it from Zarr metadata.
 LOCK_SUFFIX: str = ".edit.lock"
+# Member backups sit beside the store, since a copy inside it would be a member.
+MEMBER_BACKUP_SUFFIX: str = ".edit.backup"
 
 
 @contextmanager
@@ -125,12 +127,53 @@ def store_directory(root: zarr.Group) -> Path:
     return Path(location)
 
 
+def attr_target(root: zarr.Group, key: str) -> tuple[zarr.Group, str]:
+    """Return the group and attribute name an edit record key addresses.
+
+    Parameters
+    ----------
+    root
+        Root group of the store.
+    key
+        Attribute name for the root, or ``'group/path:name'`` for a subgroup.
+
+    Returns
+    -------
+    group
+        Group holding the attribute.
+    name
+        Attribute name.
+    """
+    if ":" in key:
+        group_path, name = key.split(":", 1)
+        return root[group_path], name
+    return root, key
+
+
+def member_backup_root(directory: Path) -> Path:
+    """Return the directory holding member backups for a store.
+
+    Parameters
+    ----------
+    directory
+        Directory backing the store.
+
+    Returns
+    -------
+    result
+        Sibling directory of the store.
+    """
+    return directory.with_name(directory.name + MEMBER_BACKUP_SUFFIX)
+
+
 def begin_edit(
     root: zarr.Group,
     array_paths: list[str],
     attrs: dict[str, Any] | None = None,
     groups: list[str] | None = None,
     files: list[str] | None = None,
+    members: list[str] | None = None,
+    added_attrs: list[str] | None = None,
 ) -> dict[str, int]:
     """Open an edit, recording enough state to undo it.
 
@@ -159,6 +202,12 @@ def begin_edit(
         relative to the store. Each is copied aside first and restored on
         revert, so a byte map cannot be left describing images the metadata was
         rolled back past.
+    members
+        Existing arrays or groups the edit will rewrite or delete, as paths
+        relative to the store. Each is copied whole beside the store and
+        restored on revert.
+    added_attrs
+        Attributes the edit adds, which revert deletes, keyed as for ``attrs``.
 
     Returns
     -------
@@ -168,6 +217,19 @@ def begin_edit(
     if root.attrs.get(EDIT_FLAG):
         raise RuntimeError("Cannot begin an edit while another edit is recorded.")
     marks = {path: int(root[path].shape[0]) for path in array_paths}
+    if members:
+        directory = store_directory(root)
+        backup_root = member_backup_root(directory)
+        for relative in members:
+            backup = backup_root / relative
+            temporary = backup.with_name(backup.name + ".tmp")
+            # Clear copies left by an edit that crashed before naming them:
+            for stale in (temporary, backup):
+                if stale.exists():
+                    shutil.rmtree(stale)
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(directory / relative, temporary)
+            os.replace(temporary, backup)
     saved = []
     if files:
         directory = store_directory(root)
@@ -186,6 +248,8 @@ def begin_edit(
         "attrs": attrs or {},
         "groups": list(groups or []),
         "files": saved,
+        "members": list(members or []),
+        "added_attrs": list(added_attrs or []),
     }
     return marks
 
@@ -229,6 +293,10 @@ def _remove_backups(root: zarr.Group, state: dict[str, Any]) -> None:
         backup = directory / (relative + BACKUP_SUFFIX)
         if backup.exists():
             backup.unlink()
+    if state.get("members"):
+        backup_root = member_backup_root(store_directory(root))
+        if backup_root.exists():
+            shutil.rmtree(backup_root)
 
 
 def _finish_committed_edit(root: zarr.Group, state: dict[str, Any]) -> None:
@@ -271,6 +339,20 @@ def recover_edit(root: zarr.Group) -> bool:
     for path in state.get("groups", []):
         if path in root:
             del root[path]
+    if state.get("members"):
+        directory = store_directory(root)
+        backup_root = member_backup_root(directory)
+        for relative in state["members"]:
+            backup = backup_root / relative
+            # A missing backup was restored by an earlier, interrupted revert.
+            if not backup.exists():
+                continue
+            target = directory / relative
+            if target.exists():
+                shutil.rmtree(target)
+            os.replace(backup, target)
+        if backup_root.exists():
+            shutil.rmtree(backup_root)
     for path, mark in state["marks"].items():
         array = root[path]
         if array.shape[0] > mark:
@@ -288,12 +370,12 @@ def recover_edit(root: zarr.Group) -> bool:
             target.unlink()
 
     for key, value in state.get("attrs", {}).items():
-        # Parse group/path:attr keys while bare keys address root attributes.
-        if ":" in key:
-            group_path, attr_name = key.split(":", 1)
-            root[group_path].attrs[attr_name] = value
-        else:
-            root.attrs[key] = value
+        group, name = attr_target(root, key)
+        group.attrs[name] = value
+    for key in state.get("added_attrs", []):
+        group, name = attr_target(root, key)
+        if name in group.attrs:
+            del group.attrs[name]
     # Keep rollback state active until the restored layout is published.
     consolidate(root)
     del root.attrs[EDIT_FLAG]

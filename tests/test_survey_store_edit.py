@@ -125,14 +125,14 @@ class TestTransaction:
         # Simulate a crash mid-edit: data grown and partially written, one
         # metadata array grown, the rest untouched, flag never cleared
         root["data"].resize((5, 64, 64))
-        root["metadata/bmaj"].resize((5,))
+        root["metadata/resolution_major"].resize((5,))
         root.attrs["n_images"] = 5
 
         recovered = recover_pending_edit(store_path)
         assert recovered
         root = open_rw(store_path)
         assert root["data"].shape[0] == 3
-        assert root["metadata/bmaj"].shape[0] == 3
+        assert root["metadata/resolution_major"].shape[0] == 3
         assert root.attrs["n_images"] == 3
         assert not root.attrs.get(EDIT_FLAG)
         # Store still opens and reads normally

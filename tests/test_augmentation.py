@@ -7,10 +7,12 @@ from astropy import units as u
 from astropy.coordinates import FK4, FK5, ICRS, FK4NoETerms, SkyCoord
 from astropy.wcs import WCS
 from dfreproject import calculate_reprojection
+from dfreproject.reproject import VALID_PROJECTIONS
+from reproject import reproject_interp
 
 from survey2zarray.dataset.augmentation import S2ZAugmentation
 from survey2zarray.dataset.signal_transforms import SignalTransform
-from survey2zarray.dataset.sky_transforms import SkyTransform
+from survey2zarray.dataset.sky_transforms import SkyTransform, projection_code
 
 MAX_CROP = 8.0  # arcsec, the largest square servable at any rotation
 
@@ -292,6 +294,82 @@ class TestSkyTransform:
         assert output.dtype == np.float32
         assert np.isfinite(output).all()
         np.testing.assert_allclose(output, 1.0, rtol=1e-6, atol=1e-6)
+
+    @pytest.mark.parametrize("projection", ["CAR", "ZEA", "AIT"])
+    def test_projections_dfreproject_lacks_use_astropy(self, monkeypatch, projection):
+        calls = []
+
+        def fake_reproject(source_hdu, target_wcs, shape_out, **kwargs):
+            calls.append(source_hdu)
+            return np.zeros(shape_out)
+
+        monkeypatch.setattr(
+            "survey2zarray.dataset.sky_transforms.reproject_interp", fake_reproject
+        )
+        monkeypatch.setattr(
+            "survey2zarray.dataset.sky_transforms.calculate_reprojection",
+            lambda *_args, **_kwargs: pytest.fail(f"{projection} used dfreproject"),
+        )
+        transform = SkyTransform({}, MAX_CROP)
+        centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
+        wcs_in = make_tile_wcs()
+        wcs_in.wcs.ctype = [f"RA---{projection}", f"DEC--{projection}"]
+        wcs_out = transform._build_skybox_wcs(centre, 8, 8, (1.0, 1.0), 0.0)
+
+        transform._reproject_planes([np.ones((16, 16))], wcs_in, wcs_out, (8, 8))
+        assert len(calls) == 1
+
+    @pytest.mark.parametrize("projection", ["TAN", "SIN"])
+    def test_tan_and_sin_use_dfreproject(self, monkeypatch, projection):
+        monkeypatch.setattr(
+            "survey2zarray.dataset.sky_transforms.reproject_interp",
+            lambda *_args, **_kwargs: pytest.fail(f"{projection} used astropy"),
+        )
+        transform = SkyTransform({}, MAX_CROP)
+        centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
+        wcs_in = make_tile_wcs()
+        wcs_in.wcs.ctype = [f"RA---{projection}", f"DEC--{projection}"]
+        wcs_out = transform._build_skybox_wcs(centre, 8, 8, (1.0, 1.0), 0.0)
+
+        output = transform._reproject_planes(
+            [np.ones((16, 16))], wcs_in, wcs_out, (8, 8)
+        )
+        assert output.shape == (1, 8, 8)
+
+    def test_a_car_input_matches_a_direct_astropy_reprojection(self):
+        transform = SkyTransform({}, MAX_CROP)
+        centre = SkyCoord(ra=150.0 * u.deg, dec=2.0 * u.deg, frame=ICRS)
+        wcs_in = make_tile_wcs(nx=32, ny=32)
+        wcs_in.wcs.ctype = ["RA---CAR", "DEC--CAR"]
+        wcs_out = transform._build_skybox_wcs(centre, 8, 8, (1.0, 1.0), 30.0)
+        yy, xx = np.mgrid[0:32, 0:32]
+        plane = (xx + 2.0 * yy).astype(np.float32)
+
+        output = transform._reproject_planes([plane], wcs_in, wcs_out, (8, 8))
+        expected = reproject_interp(
+            (plane, wcs_in),
+            wcs_out,
+            shape_out=(8, 8),
+            order="bilinear",
+            roundtrip_coords=True,
+            return_footprint=False,
+            parallel=False,
+        )
+        np.testing.assert_allclose(output[0], expected, rtol=1e-6)
+        assert np.isfinite(output).all()
+
+    @pytest.mark.parametrize(
+        ("ctype", "code"),
+        [("RA---TAN-SIP", "TAN"), ("GLON-CAR", "CAR"), ("RA---SIN", "SIN")],
+    )
+    def test_projection_codes(self, ctype, code):
+        wcs = make_tile_wcs()
+        wcs.wcs.ctype = [ctype, ctype.replace("RA--", "DEC-").replace("GLON", "GLAT")]
+        assert projection_code(wcs) == code
+
+    def test_dfreproject_projections_are_pinned(self):
+        # A fork release adding projections changes which inputs use Astropy.
+        assert set(VALID_PROJECTIONS) == {"TAN", "SIN"}
 
     def test_output_shapes_and_state_sharing(self):
         # One sampled state applied to all surveys: same angular crop size,

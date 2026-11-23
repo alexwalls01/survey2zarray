@@ -1,1 +1,1 @@
-"""Provide a radio-astronomy dataset pipeline."""
+"""Provide a radio and optical astronomy dataset pipeline."""

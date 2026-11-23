@@ -8,7 +8,7 @@ from survey2zarray.cli.survey import survey
 
 @click.group()
 def cli() -> None:
-    """Expose the multi-view radio-astronomy dataset pipeline."""
+    """Expose the multi-view radio and optical astronomy dataset pipeline."""
 
 
 cli.add_command(survey)

@@ -370,7 +370,13 @@ class TestAlignedRows:
         for survey in store.surveys:
             sub = store.survey(survey)
             assert sub.data.shape[0] == store.n_sources
-            for name in ("crpix", "pixel_shape", "image_index", "bmaj", "bunit"):
+            for name in (
+                "crpix",
+                "pixel_shape",
+                "image_index",
+                "resolution_major",
+                "bunit",
+            ):
                 assert sub.group["metadata"][name].shape[0] == store.n_sources
 
     def test_the_index_map_is_the_identity_on_covered_sources(self, grid_store):

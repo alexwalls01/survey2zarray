@@ -36,10 +36,15 @@ from survey2zarray.stores.dataset_store.dataset_store import (
 from survey2zarray.stores.dataset_store.duplicates import (
     find_catalogue_duplicates,
     find_stored_duplicates,
-    matched_beams,
+    matched_resolutions,
 )
 from survey2zarray.stores.dataset_store.geometry import edge_padding_for, square_size
-from survey2zarray.stores.store import open_store
+from survey2zarray.stores.store import (
+    DATASET_SCHEMA_VERSION,
+    DATASET_UPGRADE_COMMAND,
+    check_editable,
+    open_store,
+)
 from survey2zarray.stores.survey_store.fits import quiet_fits_warnings
 from survey2zarray.stores.survey_store.survey_store import SurveyStore
 from survey2zarray.stores.transaction import (
@@ -163,7 +168,7 @@ def append_cutout_rows(
 def filter_sources(
     df: pd.DataFrame,
     maps: dict[str, list[Any]],
-    beams: dict[str, np.ndarray],
+    resolutions: dict[str, np.ndarray],
     keep: np.ndarray,
 ) -> tuple[pd.DataFrame, dict[str, list[Any]], dict[str, np.ndarray]]:
     """Drop rows from a catalogue and its per-survey arrays together.
@@ -176,15 +181,15 @@ def filter_sources(
         Catalogue.
     maps
         Per survey, the matched image index per row.
-    beams
-        Per survey, the matched image's beam major axis per row.
+    resolutions
+        Per survey, the matched image's resolution major axis per row.
     keep
         Rows to retain.
 
     Returns
     -------
     result
-        The filtered catalogue, maps, and beams.
+        The filtered catalogue, maps, and resolutions.
     """
     return (
         df[keep].reset_index(drop=True),
@@ -192,7 +197,7 @@ def filter_sources(
             survey: [m for m, k in zip(matches, keep, strict=True) if k]
             for survey, matches in maps.items()
         },
-        {survey: values[keep] for survey, values in beams.items()},
+        {survey: values[keep] for survey, values in resolutions.items()},
     )
 
 
@@ -263,6 +268,7 @@ def append_survey(
         raise RuntimeError(
             f"Dataset store {store_path} is incomplete. Rebuild it before use."
         )
+    check_editable(root, DATASET_SCHEMA_VERSION, store_path, DATASET_UPGRADE_COMMAND)
 
     survey_store_path = Path(survey_store_path)
     survey_name = survey_name or survey_store_path.name
@@ -385,6 +391,7 @@ def append_sources(
         raise RuntimeError(
             f"Dataset store {store_path} is incomplete. Rebuild it before use."
         )
+    check_editable(root, DATASET_SCHEMA_VERSION, store_path, DATASET_UPGRADE_COMMAND)
 
     surveys = list(root.attrs["surveys"])
     diameter = float(root.attrs["disc_diameter_arcsec"])
@@ -441,7 +448,7 @@ def append_sources(
         return root
 
     new_maps = {}
-    new_beams = {}
+    new_resolutions = {}
     for survey in surveys:
         store = stores[survey]
         source_image_map = match_coords_to_images(
@@ -449,7 +456,7 @@ def append_sources(
         )
         matches = [source_image_map[source_id] for source_id in df_new["id"]]
         new_maps[survey] = matches
-        new_beams[survey] = matched_beams(store, matches)
+        new_resolutions[survey] = matched_resolutions(store, matches)
 
     # Compare with stored sources first to keep incremental and one-shot results equal.
     existing_coords = SkyCoord(
@@ -458,7 +465,7 @@ def append_sources(
         frame=ICRS,
     )
     existing_presence = {}
-    existing_beams = {}
+    existing_resolutions = {}
     for survey in surveys:
         sub = root["surveys"][survey]
         entries = sub["index_map"][:]
@@ -466,36 +473,41 @@ def append_sources(
         index_map = entries[held]
         presence = np.zeros(n_sources, dtype=bool)
         presence[index_map] = True
-        beams = np.full(n_sources, np.nan)
-        beams[index_map] = sub["metadata"]["bmaj"][:][held]
+        resolutions = np.full(n_sources, np.nan)
+        resolutions[index_map] = sub["metadata"]["resolution_major"][:][held]
         existing_presence[survey] = presence
-        existing_beams[survey] = beams
+        existing_resolutions[survey] = resolutions
     duplicates = find_stored_duplicates(
-        df_new, new_maps, new_beams, existing_coords, existing_presence, existing_beams
+        df_new,
+        new_maps,
+        new_resolutions,
+        existing_coords,
+        existing_presence,
+        existing_resolutions,
     )
     warn_many(
         logger,
         df_new["id"][duplicates],
         "{n} duplicate source(s) skipped, unresolvable from one already stored "
-        "within the beam of the finest common survey",
+        "within the resolution of the finest common survey",
     )
-    df_new, new_maps, new_beams = filter_sources(
-        df_new, new_maps, new_beams, ~duplicates
+    df_new, new_maps, new_resolutions = filter_sources(
+        df_new, new_maps, new_resolutions, ~duplicates
     )
     if len(df_new) == 0:
         logger.info("No new sources to append.")
         return root
 
     # Only candidates retained from the stored comparison may suppress later rows.
-    internal = find_catalogue_duplicates(df_new, new_maps, new_beams)
+    internal = find_catalogue_duplicates(df_new, new_maps, new_resolutions)
     if internal.any():
         warn_many(
             logger,
             df_new["id"][internal],
             "{n} source(s) skipped, duplicated within the appended catalogue",
         )
-        df_new, new_maps, new_beams = filter_sources(
-            df_new, new_maps, new_beams, ~internal
+        df_new, new_maps, new_resolutions = filter_sources(
+            df_new, new_maps, new_resolutions, ~internal
         )
         if len(df_new) == 0:
             logger.info("No new sources to append.")
@@ -507,7 +519,9 @@ def append_sources(
     new_maps = {
         survey: [matches[i] for i in order] for survey, matches in new_maps.items()
     }
-    new_beams = {survey: values[order] for survey, values in new_beams.items()}
+    new_resolutions = {
+        survey: values[order] for survey, values in new_resolutions.items()
+    }
 
     # One transaction state covers source rows, cutouts, and index maps.
     array_paths = [f"sources/{key}" for key in root["sources"].array_keys()]

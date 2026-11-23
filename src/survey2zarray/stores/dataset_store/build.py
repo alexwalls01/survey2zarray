@@ -27,7 +27,7 @@ from survey2zarray.stores.dataset_store.coverage import (
 from survey2zarray.stores.dataset_store.dataset_store import PADDING
 from survey2zarray.stores.dataset_store.duplicates import (
     find_catalogue_duplicates,
-    matched_beams,
+    matched_resolutions,
 )
 from survey2zarray.stores.dataset_store.geometry import (
     blank_outside_disc,
@@ -40,7 +40,13 @@ from survey2zarray.stores.dataset_store.layout import (
     is_power_of_two,
     shard_rows,
 )
-from survey2zarray.stores.store import consolidate, create_store, open_store
+from survey2zarray.stores.store import (
+    DATASET_SCHEMA_VERSION,
+    consolidate,
+    create_store,
+    open_store,
+    stamp_version,
+)
 from survey2zarray.stores.survey_store.build import REMOTE_MINIMUM_WORKERS
 from survey2zarray.stores.survey_store.fits import quiet_fits_warnings
 from survey2zarray.stores.survey_store.references import is_remote
@@ -60,14 +66,16 @@ CARRIED_METADATA_KEYS: list[str] = [
     "frequency",
     "bandwidth",
     "date",
-    "bmaj",
-    "bmin",
-    "bpa",
+    "resolution_major",
+    "resolution_minor",
+    "resolution_pa",
     "bunit",
+    "band",
+    "zeropoint",
     "equinox",
     "radesys",
 ]
-STRING_METADATA_KEYS: list[str] = ["ctype", "telescope", "bunit", "radesys"]
+STRING_METADATA_KEYS: list[str] = ["ctype", "telescope", "bunit", "band", "radesys"]
 
 # Match HEADER_WORKERS to cap archive connections across both build passes.
 EXTRACTION_WORKERS: int = 8
@@ -548,6 +556,7 @@ def create_empty_substore(
     compressors = [BloscCodec(cname="zstd", clevel=3, shuffle="bitshuffle")]
     sub = surveys_group.require_group(survey)
     sub.attrs["observation_type"] = store.observation_type
+    sub.attrs["band"] = str(store.root.attrs.get("band", ""))
     if store.n_chan is not None:
         sub.attrs["n_chan"] = int(store.n_chan)
     sub.attrs["n_cutouts"] = 0
@@ -1003,9 +1012,9 @@ def build_dataset_store(
         f"{diameter:.1f} arcsec discs padded for {pad_scale:.2f} arcsec/pixel."
     )
 
-    # Duplicate checks require matched-image beams from every survey.
+    # Duplicate checks require matched-image resolutions from every survey.
     source_image_maps = {}
-    beams = {}
+    resolutions = {}
     for survey in survey_names:
         store = stores[survey]
         logger.info(f"Matching catalogue source coordinates to {survey} images ...")
@@ -1014,15 +1023,15 @@ def build_dataset_store(
         )
         matches = [source_image_map[source_id] for source_id in df["id"]]
         source_image_maps[survey] = matches
-        beams[survey] = matched_beams(store, matches)
+        resolutions[survey] = matched_resolutions(store, matches)
 
-    duplicates = find_catalogue_duplicates(df, source_image_maps, beams)
+    duplicates = find_catalogue_duplicates(df, source_image_maps, resolutions)
     if duplicates.any():
         warn_many(
             logger,
             df["id"][duplicates],
             "{n} duplicate source(s) dropped, unresolvable from another "
-            "within the beam of the finest common survey",
+            "within the resolution of the finest common survey",
         )
         keep = ~duplicates
         df = df[keep].reset_index(drop=True)
@@ -1052,6 +1061,7 @@ def build_dataset_store(
         "shard_size": shard_size,
         # A changed bucketing rule requires reordered source rows.
         "bucketing": rule.as_dict(),
+        "schema_version": DATASET_SCHEMA_VERSION,
     }
     resuming = resume and resumable_build(out_path, recipe)
     if resuming:
@@ -1060,6 +1070,7 @@ def build_dataset_store(
     else:
         root = create_store(out_path)
     root.attrs["complete"] = False
+    stamp_version(root, DATASET_SCHEMA_VERSION)
     root.attrs["max_cutout_size_arcsec"] = cutout_size
     root.attrs["disc_diameter_arcsec"] = diameter
     # Record padding scale so appends can detect a reduced servable square.

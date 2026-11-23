@@ -21,7 +21,13 @@ from survey2zarray.stores.dataset_store.geometry import (
     edge_padding_for,
     square_size,
 )
-from survey2zarray.stores.store import apply_coalesce_gap, open_store
+from survey2zarray.stores.migrations import DATASET_READ_ADAPTERS, adapt_metadata
+from survey2zarray.stores.store import (
+    DATASET_SCHEMA_VERSION,
+    apply_coalesce_gap,
+    check_readable,
+    open_store,
+)
 from survey2zarray.stores.wcs import reconstruct_wcs
 from survey2zarray.utils.logging import get_logger
 
@@ -105,6 +111,8 @@ class SurveySubStore:
         Read from the stored attribute, never inferred from array shape.
     n_chan
         Channel count for spectral surveys.
+    survey_band
+        Band of the survey, empty where none is recorded.
     n_cutouts
         Cutouts this survey holds, which is the count of sources it covers.
         Never ``data.shape[0]``, since every survey has a row per source and
@@ -125,12 +133,14 @@ class SurveySubStore:
         group: zarr.Group,
         wcs_cache_size: int = 512,
         coalesce_gap: int | None = None,
+        schema_version: int = DATASET_SCHEMA_VERSION,
     ) -> None:
         self.group = group
         self.coalesce_gap = coalesce_gap
         # Build metadata fixes the observation type independently of array shape.
         self.observation_type = group.attrs["observation_type"]
         self.n_chan = group.attrs.get("n_chan")
+        self.survey_band = group.attrs.get("band", "")
         self.n_cutouts = group.attrs["n_cutouts"]
         self.data = group["data"]
         self.shard_size = int((self.data.shards or self.data.chunks)[0])
@@ -144,7 +154,12 @@ class SurveySubStore:
         }
 
         # Single metadata chunks require one read per array.
-        metadata = group["metadata"]
+        metadata = adapt_metadata(
+            group["metadata"],
+            schema_version,
+            DATASET_SCHEMA_VERSION,
+            DATASET_READ_ADAPTERS,
+        )
         self.crval = metadata["crval"][:]
         self.crpix = metadata["crpix"][:]
         self.cd = metadata["cd"][:]
@@ -156,10 +171,12 @@ class SurveySubStore:
         self.frequency = metadata["frequency"][:]
         self.bandwidth = metadata["bandwidth"][:]
         self.date = metadata["date"][:]
-        self.bmaj = metadata["bmaj"][:]
-        self.bmin = metadata["bmin"][:]
-        self.bpa = metadata["bpa"][:]
+        self.resolution_major = metadata["resolution_major"][:]
+        self.resolution_minor = metadata["resolution_minor"][:]
+        self.resolution_pa = metadata["resolution_pa"][:]
         self.bunit = metadata["bunit"][:]
+        self.band = metadata["band"][:]
+        self.zeropoint = metadata["zeropoint"][:]
         self.equinox = metadata["equinox"][:]
         self.radesys = metadata["radesys"][:]
 
@@ -646,6 +663,7 @@ class DatasetStore:
             raise RuntimeError(
                 f"Dataset store {path} is incomplete. Rebuild it before use."
             )
+        self.schema_version = check_readable(root, DATASET_SCHEMA_VERSION, path)
         check_index_consistency(root)
         self.surveys = list(root.attrs["surveys"])
         self.max_cutout_size = float(root.attrs["max_cutout_size_arcsec"])
@@ -675,7 +693,9 @@ class DatasetStore:
 
         self._substores = {
             survey: SurveySubStore(
-                root["surveys"][survey], coalesce_gap=self.coalesce_gap
+                root["surveys"][survey],
+                coalesce_gap=self.coalesce_gap,
+                schema_version=self.schema_version,
             )
             for survey in self.surveys
         }

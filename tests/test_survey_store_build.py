@@ -198,7 +198,9 @@ class TestRemoteBuild:
             "pixel_shape",
             "pixel_centre",
             "pixel_scale",
-            "bmaj",
+            "resolution_major",
+            "band",
+            "zeropoint",
         ]:
             np.testing.assert_array_equal(local[key][:], remote[key][:])
         assert list(local["ctype"][:]) == list(remote["ctype"][:])

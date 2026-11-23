@@ -168,3 +168,18 @@ def append_survey(store_path: str, survey_store: str, name: str | None) -> None:
     )
 
     append_survey_to_store(store_path, survey_store, survey_name=name)
+
+
+@dataset.command("upgrade")
+@click.argument("store_path", type=click.Path(exists=True, file_okay=False))
+def upgrade(store_path: str) -> None:
+    """Upgrade a dataset store to the current schema version.
+
+    Parameters
+    ----------
+    store_path
+        Dataset store path.
+    """
+    from survey2zarray.stores.migrations import upgrade_dataset_store
+
+    upgrade_dataset_store(store_path)

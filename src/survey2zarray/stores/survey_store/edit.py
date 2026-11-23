@@ -9,10 +9,18 @@ import zarr
 from astropy import units as u
 from astropy.coordinates import ICRS, SkyCoord
 
-from survey2zarray.stores.store import open_store
+from survey2zarray.stores.store import (
+    SURVEY_SCHEMA_VERSION,
+    SURVEY_UPGRADE_COMMAND,
+    check_editable,
+    open_store,
+)
 from survey2zarray.stores.survey_store.build import (
     STRING_METADATA_KEYS,
+    apply_band_pattern,
+    apply_resolution,
     build_header_index,
+    compile_band_pattern,
     extend_reference_map,
     resolve_fits_list,
     write_image_data_to_zarr_array,
@@ -118,11 +126,14 @@ def append_tiles(
     tolerance_px: float = 0.1,
     max_workers: int | None = None,
     storage_options: dict[str, dict] | None = None,
+    skip_other_bands: bool = False,
 ) -> zarr.Group:
     """Add images to an existing survey store.
 
     Warn and skip duplicate images. Grow the image axis and spatial dimensions
-    as required, leaving added spatial regions at the fill value.
+    as required, leaving added spatial regions at the fill value. The store's
+    ``band_pattern`` and ``resolution`` apply to the new images as they did at
+    build.
 
     Parameters
     ----------
@@ -138,6 +149,9 @@ def append_tiles(
         Filesystem options keyed by protocol, as in `build_survey_store`.
         Defaults to what the store recorded when it was built, so an append
         reuses the archive configuration.
+    skip_other_bands
+        Whether to record images of another band as unwritten and append the
+        rest. Otherwise any such image refuses the whole append.
 
     Returns
     -------
@@ -157,6 +171,7 @@ def append_tiles(
         raise RuntimeError(
             f"Conversion of {store_path} is incomplete. Reconvert it before use."
         )
+    check_editable(root, SURVEY_SCHEMA_VERSION, store_path, SURVEY_UPGRADE_COMMAND)
     observation_type = root.attrs["observation_type"]
     access_mode = root.attrs["access_mode"]
     n_chan = root.attrs.get("n_chan")
@@ -171,7 +186,33 @@ def append_tiles(
         max_workers=max_workers,
         storage_options=storage_options,
     )
-    new_type, new_n_chan = check_compatibility(image_catalogue)
+    band_pattern = compile_band_pattern(root.attrs.get("band_pattern"))
+    if band_pattern is not None:
+        apply_band_pattern(image_catalogue, band_pattern)
+    if root.attrs.get("resolution") is not None:
+        apply_resolution(image_catalogue, float(root.attrs["resolution"]))
+
+    store_band = root.attrs.get("band", "")
+    other_bands = {
+        str(m["image_location"]): m["band"]
+        for m in image_catalogue
+        if m["band"] != store_band
+    }
+    if other_bands and not skip_other_bands:
+        raise IncompatibleTilesError(
+            other_bands_message(store_path, store_band, other_bands)
+        )
+    image_catalogue = [
+        m for m in image_catalogue if str(m["image_location"]) not in other_bands
+    ]
+    if not image_catalogue:
+        logger.info("No images of this store's band to append.")
+        write_append_records(
+            store_path, image_valid_df, metadata_valid_df, {}, {}, other_bands
+        )
+        return root
+
+    new_type, new_n_chan, _ = check_compatibility(image_catalogue)
     if new_type != observation_type:
         raise IncompatibleTilesError(
             f"Appended images are {new_type}. Store {store_path} is {observation_type}."
@@ -229,21 +270,123 @@ def append_tiles(
     root.attrs["n_images"] = n_old + n_new
     commit_edit(root)
 
-    # Renumber array_index from the rows assigned during this append.
-    image_valid_df = image_valid_df.copy()
     written = {
         str(m["image_location"]): n_old + i for i, m in enumerate(image_catalogue)
     }
-    image_valid_df["array_index"] = [
-        written.get(str(location)) for location in image_valid_df["image_location"]
-    ]
-    is_duplicate = (
-        image_valid_df["image_location"].astype(str).isin(skipped_as_duplicate)
+    write_append_records(
+        store_path,
+        image_valid_df,
+        metadata_valid_df,
+        written,
+        skipped_as_duplicate,
+        other_bands,
     )
+    logger.info(f"Appended {n_new} images to {store_path}.")
+    return root
+
+
+def other_bands_message(
+    store_path: Path, store_band: str, other_bands: dict[str, str]
+) -> str:
+    """Describe images whose band differs from a store's.
+
+    Parameters
+    ----------
+    store_path
+        Location of the store.
+    store_band
+        Band of the store, ``''`` where it has none.
+    other_bands
+        Band of each refused image, keyed by location.
+
+    Returns
+    -------
+    result
+        Message naming the images and, where the store holds one band, the
+        sibling store each band belongs in.
+    """
+    by_band: dict[str, list[str]] = {}
+    for location, band in other_bands.items():
+        by_band.setdefault(band, []).append(location)
+    lines = [f"Store {store_path} holds band {store_band or 'none'}."]
+    for band, locations in sorted(by_band.items()):
+        if store_band and band:
+            sibling = sibling_band_path(store_path, store_band, band)
+            lines.append(
+                f"Band {band} applies to {locations} and belongs in {sibling}."
+            )
+        else:
+            lines.append(f"Band {band or 'none'} applies to {locations}.")
+    return " ".join(lines)
+
+
+def sibling_band_path(store_path: Path, store_band: str, band: str) -> Path:
+    """Return the store a split build would have written another band to.
+
+    Parameters
+    ----------
+    store_path
+        Location of a store holding one band.
+    store_band
+        Band of that store.
+    band
+        Another band.
+
+    Returns
+    -------
+    result
+        ``store_path`` with its ``_<store_band>`` name ending replaced, or with
+        ``_<band>`` added where its name has no such ending.
+    """
+    suffix = ".zarr" if store_path.suffix == ".zarr" else ""
+    stem = store_path.name.removesuffix(suffix)
+    ending = f"_{store_band}"
+    if stem.endswith(ending):
+        stem = stem.removesuffix(ending)
+    return store_path.with_name(f"{stem}_{band}{suffix}")
+
+
+def write_append_records(
+    store_path: Path,
+    image_valid_df: pd.DataFrame,
+    metadata_valid_df: pd.DataFrame,
+    written: dict[str, int],
+    duplicates: set[str],
+    other_bands: dict[str, str],
+) -> None:
+    """Add an append's provenance records to the store's CSV files.
+
+    Parameters
+    ----------
+    store_path
+        Location of the store.
+    image_valid_df, metadata_valid_df
+        Records from the append's header pass.
+    written
+        Row each appended image was written to, keyed by location.
+    duplicates
+        Locations skipped as duplicates of stored footprints.
+    other_bands
+        Band of each image skipped for belonging to another store, keyed by
+        location.
+    """
+    image_valid_df = image_valid_df.copy()
+    locations = image_valid_df["image_location"].astype(str)
+    image_valid_df["array_index"] = [written.get(location) for location in locations]
+    is_duplicate = locations.isin(duplicates)
     image_valid_df.loc[is_duplicate, "converted"] = False
     image_valid_df.loc[is_duplicate, "error"] = (
         "Duplicate footprint, already in the store"
     )
+    for location, band in other_bands.items():
+        refused = locations == location
+        image_valid_df.loc[refused, "converted"] = False
+        image_valid_df.loc[refused, "error"] = (
+            f"Band {band or 'none'}, not this store's"
+        )
+    metadata_valid_df = metadata_valid_df[
+        ~metadata_valid_df["image_location"].astype(str).isin(other_bands)
+    ]
     for name, df in [
         ("image_valid.csv", image_valid_df),
         ("metadata_valid.csv", metadata_valid_df),
@@ -252,9 +395,6 @@ def append_tiles(
         if csv_path.exists():
             df = pd.concat([pd.read_csv(csv_path), df], ignore_index=True)
         df.to_csv(csv_path, index=False)
-
-    logger.info(f"Appended {n_new} images to {store_path}.")
-    return root
 
 
 class _OffsetArray:
@@ -314,6 +454,12 @@ def retry_failed_tiles(
         Where the store holds no record of which files were used.
     """
     store_path = Path(store_path)
+    check_editable(
+        open_store(store_path, mode="r"),
+        SURVEY_SCHEMA_VERSION,
+        store_path,
+        SURVEY_UPGRADE_COMMAND,
+    )
     record_path = store_path / "image_valid.csv"
     if not record_path.exists():
         raise FileNotFoundError(
@@ -329,21 +475,27 @@ def retry_failed_tiles(
     logger.info(
         f"Retrying {len(unread)} file(s) that {store_path.name} could not read."
     )
+    n_before = len(record)
     try:
         root = append_tiles(
-            store_path, unread, max_workers=max_workers, storage_options=storage_options
+            store_path,
+            unread,
+            max_workers=max_workers,
+            storage_options=storage_options,
+            skip_other_bands=True,
         )
     except RuntimeError:
         logger.warning(f"None of the {len(unread)} file(s) could be read this time.")
         return open_store(store_path, mode="r+")
 
-    # Retain failure records only for files that remain unreadable.
+    # Keep only the latest record of each file this retry recorded:
     record = pd.read_csv(record_path)
-    read_now = set(record.loc[record["converted"].astype(bool), "image_location"])
-    stale = record["image_location"].isin(read_now & set(unread)) & ~record[
-        "converted"
-    ].astype(bool)
-    record[~stale].to_csv(record_path, index=False)
+    latest = record.iloc[n_before:]
+    read_now = set(latest.loc[latest["converted"].astype(bool), "image_location"])
+    superseded = (record.index < n_before) & record["image_location"].isin(
+        set(latest["image_location"]) & set(unread)
+    )
+    record[~superseded].to_csv(record_path, index=False)
 
     recovered = len(read_now & set(unread))
     logger.info(
